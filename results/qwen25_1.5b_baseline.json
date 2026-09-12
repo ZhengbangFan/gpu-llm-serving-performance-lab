@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-09-12T23:34:55.461555+00:00",
+    "python": "3.11.16 (main, Aug 14 2026, 15:34:35) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "torch": "2.14.0+cu126",
+    "gpu": {
+      "cuda_available": true,
+      "device": "NVIDIA GeForce RTX 4080",
+      "total_memory_mb": 16375.5,
+      "torch_cuda_build": "12.6"
+    },
+    "model": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "config": {
+    "requests": 8,
+    "batch_size": 4,
+    "max_new_tokens": 32,
+    "warmup": 1,
+    "prompt_template": "Explain one systems concept clearly in two short sentences:"
+  },
+  "results": [
+    {
+      "mode": "direct",
+      "requested": 8,
+      "completed": 8,
+      "errors": 0,
+      "error_rate": 0.0,
+      "wall_time_ms": 4915.531699996791,
+      "throughput_requests_per_second": 1.627494335964759,
+      "generated_tokens_per_second": 52.079818750872285,
+      "request_latency_ms": {
+        "mean": 613.8342124959308,
+        "p50": 613.8608499968541,
+        "p95": 631.278279991966,
+        "p99": 633.8870959934138,
+        "min": 586.0852000041632,
+        "max": 634.5392999937758
+      },
+      "batch_latency_ms": {
+        "mean": 613.8342124959308,
+        "p50": 613.8608499968541,
+        "p95": 631.278279991966,
+        "p99": 633.8870959934138,
+        "min": 586.0852000041632,
+        "max": 634.5392999937758
+      },
+      "input_tokens_total": 352,
+      "output_tokens_total": 256,
+      "peak_gpu_memory_mb": 2956.61572265625,
+      "batch_size_distribution": {
+        "1": 8
+      }
+    },
+    {
+      "mode": "batched",
+      "requested": 8,
+      "completed": 8,
+      "errors": 0,
+      "error_rate": 0.0,
+      "wall_time_ms": 1246.9840999983717,
+      "throughput_requests_per_second": 6.415478753907485,
+      "generated_tokens_per_second": 205.29532012503952,
+      "request_latency_ms": {
+        "mean": 622.3334500027704,
+        "p50": 622.3334500027704,
+        "p95": 623.1641000049422,
+        "p99": 623.1641000049422,
+        "min": 621.5028000005987,
+        "max": 623.1641000049422
+      },
+      "batch_latency_ms": {
+        "mean": 622.3334500027704,
+        "p50": 622.3334500027704,
+        "p95": 623.081035004725,
+        "p99": 623.1474870048987,
+        "min": 621.5028000005987,
+        "max": 623.1641000049422
+      },
+      "input_tokens_total": 352,
+      "output_tokens_total": 256,
+      "peak_gpu_memory_mb": 2968.86328125,
+      "batch_size_distribution": {
+        "4": 8
+      }
+    }
+  ]
+}

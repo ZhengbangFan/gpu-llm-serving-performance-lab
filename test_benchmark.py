@@ -40,7 +40,7 @@ def test_summarize_result_reports_throughput_and_distribution():
 
 
 def test_saved_baseline_has_gpu_provenance():
-    result_path = Path(__file__).parent / "results" / "transformers_baseline.json"
+    result_path = Path(__file__).parent / "results" / "qwen25_1.5b_baseline.json"
     if not result_path.exists():
         pytest.skip("baseline has not been generated")
     payload = json.loads(result_path.read_text(encoding="utf-8"))

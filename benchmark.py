@@ -22,12 +22,18 @@ except ImportError:  # pragma: no cover - exercised only without dependencies
     AutoTokenizer = None
 
 from arrival_scheduler import TOKEN_TIMING_BOUNDARY, run_virtual_arrival_schedule
-from metrics import percentile, summarize, summarize_arrival_scheduling
+from metrics import (
+    percentile,
+    summarize,
+    summarize_arrival_scheduling,
+    summarize_token_timing,
+)
 
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_OUTPUT = Path("results/transformers_baseline.json")
 PROMPT_PREFIX = "Explain one systems concept clearly in two short sentences:"
+STREAMING_TIMING_BOUNDARY = "local_manual_decode_cuda_synchronized"
 
 
 def synchronize() -> None:
@@ -106,6 +112,370 @@ def generate_batch(tokenizer, model, prompts: list[str], max_new_tokens: int) ->
         "output_tokens": output_tokens,
         "peak_memory_mb": peak_memory_mb,
     }
+
+
+def _model_device(model):
+    """Return the device used by a loaded model, including simple test doubles."""
+
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration) as exc:
+        raise RuntimeError("model must expose a device or parameters") from exc
+
+
+def _past_key_values(model_output):
+    """Extract the cache from both model-output objects and tuple-like outputs."""
+
+    past = getattr(model_output, "past_key_values", None)
+    if past is None and isinstance(model_output, (tuple, list)) and len(model_output) > 1:
+        past = model_output[1]
+    if past is None:
+        raise RuntimeError("model.forward did not return past_key_values")
+    return past
+
+
+def generate_streaming_batch(
+    tokenizer,
+    model,
+    prompts: list[str],
+    max_new_tokens: int,
+) -> dict:
+    """Run a local, CUDA-synchronized, fixed-length manual decode.
+
+    This is intentionally separate from :meth:`model.generate`: every token
+    is selected with greedy ``argmax`` and fed through ``model.forward`` with
+    ``past_key_values``/``use_cache``.  It measures local GPU work only; it is
+    not HTTP result streaming and does not implement continuous batching.
+    """
+
+    if torch is None:
+        raise RuntimeError("PyTorch is required for streaming generation")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
+        raise ValueError("max_new_tokens must be a positive integer")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be a positive integer")
+
+    encoded_prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for prompt in prompts
+    ]
+    encoded = tokenizer(
+        encoded_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    device = _model_device(model)
+    encoded = {name: value.to(device) for name, value in encoded.items()}
+    attention_mask = encoded["attention_mask"]
+    input_tokens = [int(value) for value in attention_mask.sum(dim=1).tolist()]
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # ``generate`` derives position ids from the attention mask for left-
+    # padded inputs.  Manual forwarding must do the same or pad columns would
+    # shift the rotary positions of the real prompt tokens.
+    position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    position_ids = position_ids.masked_fill(attention_mask == 0, 1)
+
+    # Synchronization before the clock starts makes the first timestamp a
+    # completed prefill boundary rather than time spent draining old work.
+    synchronize()
+    start_time_ms = time.perf_counter() * 1000.0
+    with torch.inference_mode():
+        prefill_output = model.forward(
+            input_ids=encoded["input_ids"],
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+        synchronize()
+        prefill_done_ms = time.perf_counter() * 1000.0
+
+        logits = prefill_output.logits[:, -1, :]
+        next_tokens = torch.argmax(logits, dim=-1)
+        # The first timestamp is after both first-token selection and its GPU
+        # synchronization, so TTFT represents completed work.
+        synchronize()
+        token_timestamps_ms = [time.perf_counter() * 1000.0]
+        past_key_values = _past_key_values(prefill_output)
+
+        for _ in range(1, max_new_tokens):
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
+                ),
+                dim=1,
+            )
+            position_ids = attention_mask.long().cumsum(dim=-1) - 1
+            position_ids = position_ids.masked_fill(attention_mask == 0, 1)
+            decode_output = model.forward(
+                input_ids=next_tokens.unsqueeze(-1),
+                attention_mask=attention_mask,
+                position_ids=position_ids[:, -1:],
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = decode_output.logits[:, -1, :]
+            next_tokens = torch.argmax(logits, dim=-1)
+            past_key_values = _past_key_values(decode_output)
+            synchronize()
+            token_timestamps_ms.append(time.perf_counter() * 1000.0)
+
+    timing = summarize_token_timing(
+        token_timestamps_ms,
+        start_time_ms=start_time_ms,
+    )
+    prefill_ms = prefill_done_ms - start_time_ms
+    peak_memory_mb = (
+        torch.cuda.max_memory_allocated() / 1024**2
+        if torch.cuda.is_available()
+        else 0.0
+    )
+    output_tokens = [max_new_tokens for _ in prompts]
+    return {
+        "prefill_ms": prefill_ms,
+        "ttft_ms": timing["ttft_ms"],
+        "batch_itl_values_ms": timing["itl_values_ms"],
+        "batch_itl_ms": timing["itl_ms"],
+        "decode_ms": timing["decode_ms"],
+        "total_generation_latency_ms": timing["total_generation_ms"],
+        "total_generation_ms": timing["total_generation_ms"],
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "peak_memory_mb": peak_memory_mb,
+        "timing_boundary": STREAMING_TIMING_BOUNDARY,
+        "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+    }
+
+
+def summarize_streaming_result(
+    *,
+    requested: int,
+    completed: int,
+    errors: int,
+    elapsed_ms: float,
+    batch_results: list[dict],
+    requests: list[dict],
+    batch_sizes: list[int],
+    peak_memory_mb: float,
+    batch_records: list[dict] | None = None,
+) -> dict:
+    """Build the JSON-safe batch/request schema for local streaming runs."""
+
+    prefill_values = [float(result["prefill_ms"]) for result in batch_results]
+    ttft_values = [float(result["ttft_ms"]) for result in batch_results]
+    decode_values = [float(result["decode_ms"]) for result in batch_results]
+    total_values = [
+        float(result["total_generation_latency_ms"]) for result in batch_results
+    ]
+    batch_itl_values = [
+        float(value)
+        for result in batch_results
+        for value in result.get("batch_itl_values_ms", [])
+    ]
+    output_tokens = [
+        int(request["output_tokens"])
+        for request in requests
+        if request.get("error") is None and request.get("output_tokens") is not None
+    ]
+    request_total_values = [
+        float(request["total_generation_latency_ms"])
+        for request in requests
+        if request.get("error") is None
+        and request.get("total_generation_latency_ms") is not None
+    ]
+    if batch_records is None:
+        batch_records = [
+            {
+                "batch_id": int(result.get("batch_id", batch_index)),
+                "batch_size": int(batch_sizes[batch_index])
+                if batch_index < len(batch_sizes)
+                else None,
+                "prefill_ms": float(result["prefill_ms"]),
+                "ttft_ms": float(result["ttft_ms"]),
+                "batch_itl_values_ms": list(result.get("batch_itl_values_ms", [])),
+                "batch_itl_ms": dict(result.get("batch_itl_ms", summarize([]))),
+                "decode_ms": float(result["decode_ms"]),
+                "total_generation_latency_ms": float(
+                    result["total_generation_latency_ms"]
+                ),
+                "total_generation_ms": float(
+                    result.get(
+                        "total_generation_ms",
+                        result["total_generation_latency_ms"],
+                    )
+                ),
+                "output_tokens": [int(value) for value in result.get("output_tokens", [])],
+                "peak_gpu_memory_mb": float(result.get("peak_memory_mb", 0.0)),
+                "timing_boundary": STREAMING_TIMING_BOUNDARY,
+                "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+                "error": None,
+            }
+            for batch_index, result in enumerate(batch_results)
+        ]
+    elapsed_seconds = float(elapsed_ms) / 1000.0
+    total_output_tokens = sum(output_tokens)
+    return {
+        "mode": "streaming",
+        "requested": requested,
+        "completed": completed,
+        "errors": errors,
+        "error_rate": errors / requested if requested else 0.0,
+        "wall_time_ms": float(elapsed_ms),
+        "throughput_requests_per_second": (
+            completed / elapsed_seconds if elapsed_seconds else 0.0
+        ),
+        "generated_tokens_per_second": (
+            total_output_tokens / elapsed_seconds if elapsed_seconds else 0.0
+        ),
+        "request_latency_ms": summarize(request_total_values),
+        "batch_latency_ms": summarize(total_values),
+        "prefill_ms": summarize(prefill_values),
+        "ttft_ms": summarize(ttft_values),
+        "batch_itl_ms": summarize(batch_itl_values),
+        "batch_itl_values_ms": batch_itl_values,
+        "decode_ms": summarize(decode_values),
+        "total_generation_latency_ms": summarize(total_values),
+        "total_generation_ms": summarize(total_values),
+        "input_tokens_total": sum(
+            int(request["input_tokens"])
+            for request in requests
+            if request.get("error") is None and request.get("input_tokens") is not None
+        ),
+        "output_tokens": output_tokens,
+        "output_tokens_total": total_output_tokens,
+        "peak_gpu_memory_mb": float(peak_memory_mb),
+        "batch_size_distribution": dict(Counter(batch_sizes)),
+        "timing_boundary": STREAMING_TIMING_BOUNDARY,
+        "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+        "batches": batch_records,
+        "requests": requests,
+    }
+
+
+def run_streaming(
+    tokenizer,
+    model,
+    prompts: list[str],
+    batch_size: int,
+    max_new_tokens: int,
+) -> dict:
+    """Run fixed-length manual token timing over sequential local batches."""
+
+    started = time.perf_counter()
+    batch_results: list[dict] = []
+    request_records: list[dict] = []
+    batch_sizes: list[int] = []
+    batch_records: list[dict] = []
+    peak_memory_mb = 0.0
+    errors = 0
+
+    for batch_id, offset in enumerate(range(0, len(prompts), batch_size)):
+        prompt_batch = prompts[offset : offset + batch_size]
+        try:
+            result = generate_streaming_batch(
+                tokenizer,
+                model,
+                prompt_batch,
+                max_new_tokens,
+            )
+            batch_results.append(result)
+            batch_sizes.append(len(prompt_batch))
+            peak_memory_mb = max(peak_memory_mb, float(result["peak_memory_mb"]))
+            batch_records.append(
+                {
+                    "batch_id": batch_id,
+                    "batch_size": len(prompt_batch),
+                    "prefill_ms": float(result["prefill_ms"]),
+                    "ttft_ms": float(result["ttft_ms"]),
+                    "batch_itl_values_ms": list(result["batch_itl_values_ms"]),
+                    "batch_itl_ms": dict(result["batch_itl_ms"]),
+                    "decode_ms": float(result["decode_ms"]),
+                    "total_generation_latency_ms": float(
+                        result["total_generation_latency_ms"]
+                    ),
+                    "total_generation_ms": float(result["total_generation_ms"]),
+                    "output_tokens": [int(value) for value in result["output_tokens"]],
+                    "peak_gpu_memory_mb": float(result["peak_memory_mb"]),
+                    "timing_boundary": STREAMING_TIMING_BOUNDARY,
+                    "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+                    "error": None,
+                }
+            )
+            for request_offset, (input_tokens, output_tokens) in enumerate(
+                zip(result["input_tokens"], result["output_tokens"])
+            ):
+                request_records.append(
+                    {
+                        "request_id": offset + request_offset,
+                        "batch_id": batch_id,
+                        "input_tokens": int(input_tokens),
+                        "output_tokens": int(output_tokens),
+                        "prefill_ms": float(result["prefill_ms"]),
+                        "ttft_ms": float(result["ttft_ms"]),
+                        "batch_itl_values_ms": list(result["batch_itl_values_ms"]),
+                        "batch_itl_ms": dict(result["batch_itl_ms"]),
+                        "decode_ms": float(result["decode_ms"]),
+                        "total_generation_latency_ms": float(
+                            result["total_generation_latency_ms"]
+                        ),
+                        "total_generation_ms": float(result["total_generation_ms"]),
+                        "peak_gpu_memory_mb": float(result["peak_memory_mb"]),
+                        "timing_boundary": STREAMING_TIMING_BOUNDARY,
+                        "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+                        "error": None,
+                    }
+                )
+        except Exception as exc:
+            errors += len(prompt_batch)
+            message = f"{type(exc).__name__}: {exc}"
+            for request_id in range(offset, offset + len(prompt_batch)):
+                request_records.append(
+                    {
+                        "request_id": request_id,
+                        "batch_id": batch_id,
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "prefill_ms": None,
+                        "ttft_ms": None,
+                        "batch_itl_values_ms": [],
+                        "batch_itl_ms": summarize([]),
+                        "decode_ms": None,
+                        "total_generation_latency_ms": None,
+                        "total_generation_ms": None,
+                        "peak_gpu_memory_mb": 0.0,
+                        "timing_boundary": STREAMING_TIMING_BOUNDARY,
+                        "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
+                        "error": message,
+                    }
+                )
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return summarize_streaming_result(
+        requested=len(prompts),
+        completed=len(request_records) - errors,
+        errors=errors,
+        elapsed_ms=elapsed_ms,
+        batch_results=batch_results,
+        requests=request_records,
+        batch_sizes=batch_sizes,
+        peak_memory_mb=peak_memory_mb,
+        batch_records=batch_records,
+    )
 
 
 def run_direct(tokenizer, model, prompts: list[str], max_new_tokens: int) -> dict:
@@ -374,7 +744,11 @@ def gpu_metadata() -> dict:
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark direct vs tensor-batched generation")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--mode", choices=["direct", "batched", "arrival", "both"], default="both")
+    parser.add_argument(
+        "--mode",
+        choices=["direct", "batched", "arrival", "streaming", "both"],
+        default="both",
+    )
     parser.add_argument("--requests", type=int, default=8)
     parser.add_argument(
         "--batch-size",
@@ -426,7 +800,15 @@ def main() -> None:
     tokenizer, model = load_model(args.model)
     warmup_prompts = make_prompts(args.warmup)
     if warmup_prompts:
-        generate_batch(tokenizer, model, warmup_prompts, args.max_new_tokens)
+        if args.mode == "streaming":
+            generate_streaming_batch(
+                tokenizer,
+                model,
+                warmup_prompts,
+                args.max_new_tokens,
+            )
+        else:
+            generate_batch(tokenizer, model, warmup_prompts, args.max_new_tokens)
 
     prompts = make_prompts(args.requests)
     results = []
@@ -451,6 +833,16 @@ def main() -> None:
                 args.batch_size,
                 args.batch_wait_timeout_ms,
                 args.arrival_interval_ms,
+                args.max_new_tokens,
+            )
+        )
+    if args.mode == "streaming":
+        results.append(
+            run_streaming(
+                tokenizer,
+                model,
+                prompts,
+                args.batch_size,
                 args.max_new_tokens,
             )
         )

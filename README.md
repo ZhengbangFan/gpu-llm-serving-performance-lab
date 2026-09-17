@@ -11,7 +11,7 @@ A reproducible GPU inference benchmark for a real instruction-tuned language mod
 - Peak allocated GPU memory and error rate
 - Hardware, software, model, and workload provenance in JSON
 
-This is an experimental serving/performance lab, not a claim of production-scale LLM serving. Phase 1 adds a deterministic controlled-arrival scheduler around the existing sequential Transformers call. vLLM/SGLang adapters and true token streaming remain out of scope.
+This is an experimental serving/performance lab, not a claim of production-scale LLM serving. Phase 1 adds a deterministic controlled-arrival scheduler around the existing sequential Transformers call. The `streaming` mode adds local token-by-token timing for the same Transformers model; it is a manual decode benchmark, not a network streaming endpoint or a continuous-batching scheduler.
 
 ## Reproduce
 
@@ -21,12 +21,13 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt --extra-ind
 .venv/Scripts/python.exe run_generation.py --model Qwen/Qwen2.5-1.5B-Instruct --max-new-tokens 32
 .venv/Scripts/python.exe benchmark.py --model Qwen/Qwen2.5-1.5B-Instruct --mode both --requests 8 --batch-size 4 --max-new-tokens 32 --warmup 1 --output results/qwen25_1.5b_baseline.json
 .venv/Scripts/python.exe benchmark.py --model Qwen/Qwen2.5-1.5B-Instruct --mode arrival --requests 16 --batch-size 4 --arrival-interval-ms 10 --batch-wait-timeout-ms 25 --max-new-tokens 32 --output results/arrival.json
+.venv/Scripts/python.exe benchmark.py --model Qwen/Qwen2.5-1.5B-Instruct --mode streaming --requests 4 --batch-size 4 --max-new-tokens 32 --warmup 1 --output results/streaming.json
 .venv/Scripts/python.exe -c "from arrival_scheduler import simulate_arrival_batches; print(simulate_arrival_batches([0, 5, 10], 2, 8, execution_time_ms=3))"
 .venv/Scripts/python.exe -m pytest -q
 .venv/Scripts/python.exe -m py_compile benchmark.py arrival_scheduler.py metrics.py run_generation.py
 ```
 
-The first run downloads the model from Hugging Face. CUDA is required; the benchmark exits if no CUDA device is available.
+The first run downloads the model from Hugging Face. CUDA is required for `direct`, `batched`, `arrival`, and `streaming`; the benchmark exits if no CUDA device is available.
 The scheduler and metric helpers are pure Python, so the `-c` simulation, tests, and `py_compile` command do not require CUDA or model downloads. `arrival` mode still loads the configured model and executes one batch at a time.
 
 ## Arrival Mode And Metrics
@@ -42,9 +43,23 @@ Metric definitions:
 - **End-to-end latency:** batch completion time minus request arrival time (`queue wait + batch execution`).
 - **Errors:** requests whose batch failed (or were marked with an error), counted in `errors` and `error_rate`.
 
-### TTFT/ITL Boundary
+### Token Timing And Boundaries
 
-`transformers.GenerationMixin.generate` is used as a completion API in this phase; it does not expose a token stream here. Consequently, `ttft_ms` and `itl_ms` are intentionally `null`, not estimates. The explicit `token_timing_boundary` value `batch_generate_elapsed_ms_non_streaming` identifies the timing boundary: elapsed time around the complete non-streaming batch generation call. Do not compare it with true first-token or inter-token measurements until a streaming-capable path is added.
+`direct`, `batched`, and `arrival` continue to use `model.generate` as a completion API. They do not expose token timestamps: arrival records retain `ttft_ms`/`itl_ms` as `null`, while direct and batched summaries omit those fields; `token_timing_boundary` is `batch_generate_elapsed_ms_non_streaming` for those modes.
+
+`streaming` performs a fixed-length greedy decode with `model.forward(..., past_key_values=..., use_cache=True)` instead of calling `model.generate`. It uses the existing chat template and left-padded inputs. CUDA is synchronized before timing, after prefill/first-token selection, and after every decode-step token selection so each timestamp represents completed GPU work. Generation always selects exactly `--max-new-tokens` tokens; EOS is not used to shorten the run.
+
+Streaming result payloads expose batch-level summaries and per-request records. Each request includes a `batch_id` so it can be mapped back to the batch that produced it. The `batches` array contains one `batch_size` entry per generated batch, and `batch_size_distribution` summarizes those generated batches rather than expanding sizes per request. Failed request records retain their `batch_id` and carry empty batch ITL values. The timing fields are:
+
+- **Prefill:** time from the synchronized prefill start until prefill forward work completes (`prefill_ms`); first-token selection is reported separately within TTFT.
+- **TTFT (time to first token):** elapsed time from the same prefill start to the synchronized first-token selection (`ttft_ms`). In this manual path, TTFT includes prefill and first-token selection.
+- **Batch ITL (inter-token latency):** elapsed time between consecutive synchronized token selections for the shared batch decode timeline (`batch_itl_ms`). The same batch timeline is attached to each request record under `batch_itl_values_ms`/`batch_itl_ms`; it is not an independent per-request GPU timeline. A one-token output has an empty ITL distribution.
+- **Decode:** elapsed time after first-token selection through the final synchronized decode-step selection (`decode_ms`).
+- **Total generation latency:** elapsed time from prefill start through the final synchronized token selection (`total_generation_latency_ms`).
+- **Output token count:** exactly `--max-new-tokens` for each successful request (`output_tokens`).
+- **Peak memory:** peak allocated CUDA memory observed for the measured batch (`peak_gpu_memory_mb`).
+
+The explicit `timing_boundary` value identifies this as local, CUDA-synchronized manual decoding. It must not be interpreted as HTTP/network streaming latency, socket flush latency, or continuous-batching service behavior.
 
 ## Baseline
 
@@ -67,13 +82,13 @@ Raw result: `results/qwen25_1.5b_baseline.json`
 
 ## Project Structure
 
-- `benchmark.py`: direct versus tensor-batched generation benchmark
-- `metrics.py`: pure-Python padding, percentile, and arrival-accounting helpers
+- `benchmark.py`: direct, tensor-batched, arrival, and local token-timing generation benchmarks
+- `metrics.py`: pure-Python padding, percentile, arrival-accounting, and token-timestamp helpers
 - `arrival_scheduler.py`: deterministic virtual-time batching scheduler used by arrival mode and CPU tests
 - `run_generation.py`: one-request CUDA smoke test
-- `test_benchmark.py`, `test_metrics_scheduler.py`: baseline and CPU-only metric/scheduler tests
+- `test_benchmark.py`, `test_metrics_scheduler.py`, `test_streaming_schema.py`: baseline and CPU-only metric/scheduler/streaming-schema tests
 - `results/`: locally generated benchmark output; ignored by Git by default
 
 ## Experiment Plan
 
-Run one controlled sweep while keeping the model, prompt template, output length, and warmup fixed: use arrival intervals of 0, 10, 25, and 100 ms; compare max batch sizes 1, 2, 4, and 8; and hold the wait timeout at 25 ms. For each run, save the JSON output and compare request throughput, queue-wait p50/p95, end-to-end latency p50/p95, batch-size distribution, padding ratio (when input lengths are exported), and error rate. Repeat each point three times and report the median; do not overwrite `results/qwen25_1.5b_baseline.json`.
+Run one controlled sweep while keeping the model, prompt template, output length, and warmup fixed: use arrival intervals of 0, 10, 25, and 100 ms; compare max batch sizes 1, 2, 4, and 8; and hold the wait timeout at 25 ms. For each run, save the JSON output and compare request throughput, queue-wait p50/p95, end-to-end latency p50/p95, batch-size distribution, padding ratio (when input lengths are exported), and error rate. For streaming runs, also compare prefill, TTFT, batch ITL, decode, and total-generation summaries at the same fixed output length. Repeat each point three times and report the median; do not overwrite `results/qwen25_1.5b_baseline.json`.

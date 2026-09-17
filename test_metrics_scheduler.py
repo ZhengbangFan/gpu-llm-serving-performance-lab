@@ -11,6 +11,7 @@ from metrics import (
     percentile,
     summarize,
     summarize_arrival_scheduling,
+    summarize_token_timing,
 )
 
 
@@ -28,6 +29,58 @@ def test_percentile_and_summary_are_stable_for_empty_and_nonempty_values():
     assert result["mean"] == pytest.approx(2.0)
     assert result["p50"] == pytest.approx(2.0)
     assert result["p95"] == pytest.approx(2.9)
+
+
+def test_token_timing_empty_input_has_zero_durations_and_empty_itl():
+    result = summarize_token_timing([], start_time_ms=12.5)
+
+    assert result == {
+        "ttft_ms": 0.0,
+        "itl_values_ms": [],
+        "itl_ms": {
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        },
+        "decode_ms": 0.0,
+        "total_generation_ms": 0.0,
+        "output_tokens": 0,
+    }
+
+
+def test_token_timing_one_token_reports_ttft_but_no_decode_or_itl():
+    result = summarize_token_timing([17.5], start_time_ms=10.0)
+
+    assert result["ttft_ms"] == pytest.approx(7.5)
+    assert result["itl_values_ms"] == []
+    assert result["itl_ms"]["mean"] == 0.0
+    assert result["decode_ms"] == 0.0
+    assert result["total_generation_ms"] == pytest.approx(7.5)
+    assert result["output_tokens"] == 1
+
+
+def test_token_timing_multi_token_reports_deltas_and_duration_boundaries():
+    result = summarize_token_timing([100.0, 112.0, 130.0], start_time_ms=95.0)
+
+    assert result["ttft_ms"] == pytest.approx(5.0)
+    assert result["itl_values_ms"] == pytest.approx([12.0, 18.0])
+    assert result["itl_ms"]["mean"] == pytest.approx(15.0)
+    assert result["itl_ms"]["p50"] == pytest.approx(15.0)
+    assert result["decode_ms"] == pytest.approx(30.0)
+    assert result["total_generation_ms"] == pytest.approx(35.0)
+    assert result["output_tokens"] == 3
+
+
+def test_token_timing_rejects_nonfinite_or_nonmonotonic_timestamps():
+    with pytest.raises(ValueError):
+        summarize_token_timing([10.0, 9.0])
+    with pytest.raises(ValueError):
+        summarize_token_timing([float("nan")])
+    with pytest.raises(ValueError):
+        summarize_token_timing([4.0], start_time_ms=5.0)
 
 
 def test_request_timing_reports_queue_execution_and_end_to_end_components():

@@ -66,6 +66,57 @@ def summarize(values: Iterable[float]) -> dict[str, float]:
     }
 
 
+def summarize_token_timing(
+    token_timestamps_ms: Iterable[float],
+    *,
+    start_time_ms: float = 0.0,
+) -> dict[str, Any]:
+    """Summarize timestamps captured after each generated token selection.
+
+    ``token_timestamps_ms`` must be monotonic timestamps in milliseconds from
+    one timing clock (for example, ``time.perf_counter() * 1000``).  The first
+    timestamp is used for TTFT, adjacent differences form inter-token latency
+    (ITL), and the final timestamp closes the total-generation boundary.  The
+    decode duration intentionally excludes the first-token selection and is
+    therefore zero for zero or one generated token.
+
+    The helper is deliberately dependency-free so callers can exercise the
+    metric contract in CPU-only CI without importing PyTorch or Transformers.
+    """
+
+    start = _finite_time(start_time_ms, "start_time_ms")
+    timestamps = _materialize(token_timestamps_ms)
+    if any(timestamp < start for timestamp in timestamps):
+        raise ValueError("token timestamps must be >= start_time_ms")
+    if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:])):
+        raise ValueError("token timestamps must be non-decreasing")
+
+    if not timestamps:
+        return {
+            "ttft_ms": 0.0,
+            "itl_values_ms": [],
+            "itl_ms": summarize([]),
+            "decode_ms": 0.0,
+            "total_generation_ms": 0.0,
+            "output_tokens": 0,
+        }
+
+    ttft_ms = timestamps[0] - start
+    itl_values_ms = [
+        later - earlier for earlier, later in zip(timestamps, timestamps[1:])
+    ]
+    decode_ms = timestamps[-1] - timestamps[0]
+    total_generation_ms = timestamps[-1] - start
+    return {
+        "ttft_ms": ttft_ms,
+        "itl_values_ms": itl_values_ms,
+        "itl_ms": summarize(itl_values_ms),
+        "decode_ms": decode_ms,
+        "total_generation_ms": total_generation_ms,
+        "output_tokens": len(timestamps),
+    }
+
+
 def percentile_summary(values: Iterable[float]) -> dict[str, float]:
     """Descriptive alias for :func:`summarize`.
 
@@ -283,6 +334,7 @@ __all__ = [
     "percentile_summary",
     "request_timing",
     "summarize",
+    "summarize_token_timing",
     "summarize_arrival_metrics",
     "summarize_arrival_scheduling",
 ]

@@ -142,6 +142,8 @@ def generate_streaming_batch(
     model,
     prompts: list[str],
     max_new_tokens: int,
+    *,
+    capture_token_ids: bool = False,
 ) -> dict:
     """Run a local, CUDA-synchronized, fixed-length manual decode.
 
@@ -149,6 +151,8 @@ def generate_streaming_batch(
     is selected with greedy ``argmax`` and fed through ``model.forward`` with
     ``past_key_values``/``use_cache``.  It measures local GPU work only; it is
     not HTTP result streaming and does not implement continuous batching.
+    Optional token capture is for correctness checks only. The default path
+    does not retain token tensors or copy generated IDs to the host.
     """
 
     if torch is None:
@@ -186,6 +190,8 @@ def generate_streaming_batch(
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids = position_ids.masked_fill(attention_mask == 0, 1)
 
+    captured_tokens = [] if capture_token_ids else None
+
     # Synchronization before the clock starts makes the first timestamp a
     # completed prefill boundary rather than time spent draining old work.
     synchronize()
@@ -206,6 +212,8 @@ def generate_streaming_batch(
         # synchronization, so TTFT represents completed work.
         synchronize()
         token_timestamps_ms = [time.perf_counter() * 1000.0]
+        if captured_tokens is not None:
+            captured_tokens.append(next_tokens)
         past_key_values = _past_key_values(prefill_output)
 
         for _ in range(1, max_new_tokens):
@@ -234,6 +242,8 @@ def generate_streaming_batch(
             past_key_values = _past_key_values(decode_output)
             synchronize()
             token_timestamps_ms.append(time.perf_counter() * 1000.0)
+            if captured_tokens is not None:
+                captured_tokens.append(next_tokens)
 
     timing = summarize_token_timing(
         token_timestamps_ms,
@@ -246,7 +256,7 @@ def generate_streaming_batch(
         else 0.0
     )
     output_tokens = [max_new_tokens for _ in prompts]
-    return {
+    result = {
         "prefill_ms": prefill_ms,
         "ttft_ms": timing["ttft_ms"],
         "batch_itl_values_ms": timing["itl_values_ms"],
@@ -260,6 +270,10 @@ def generate_streaming_batch(
         "timing_boundary": STREAMING_TIMING_BOUNDARY,
         "token_timing_boundary": STREAMING_TIMING_BOUNDARY,
     }
+
+    if captured_tokens is not None:
+        result["generated_token_ids"] = torch.stack(captured_tokens, dim=1).cpu().tolist()
+    return result
 
 
 def summarize_streaming_result(

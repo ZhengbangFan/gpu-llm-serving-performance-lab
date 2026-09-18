@@ -1,0 +1,22 @@
+{
+  "timestamp_utc": "2026-09-18T03:01:26.296678+00:00",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "model_revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+  "gpu": "NVIDIA GeForce RTX 4080",
+  "torch": "2.14.0+cu126",
+  "transformers": "5.17.0",
+  "cuda": "12.6",
+  "python": "3.11.16",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "dtype": "torch.float16",
+  "attention_implementation": "sdpa",
+  "hf_hub_offline": "1",
+  "padding_side": "left",
+  "git_head": "44fff0f1d8c5596cd3e2c8277ab1dfa674ae461e",
+  "requests_per_run": 8,
+  "repeats": 3,
+  "warmup": "one complete 8-request run per shape",
+  "capture_in_performance": false,
+  "order_seed": 17,
+  "timing_boundary": "local_manual_decode_cuda_synchronized"
+}

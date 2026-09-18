@@ -82,7 +82,7 @@ Raw result: `results/qwen25_1.5b_baseline.json`
 
 ## Token Timing Validation
 
-See [validation report](validation/README.md) for raw GPU measurements and reproduction commands. The warmed validation uses 8 requests, batch size 4, 32 tokens per request, and one four-request warmup batch on Qwen2.5-1.5B-Instruct / RTX 4080. It completed with zero errors. These single-run checks establish working timing instrumentation; the repeated sweep below remains future work.
+See [validation report](validation/README.md) for raw GPU measurements and reproduction commands. The warmed validation uses 8 requests, batch size 4, 32 tokens per request, and one four-request warmup batch on Qwen2.5-1.5B-Instruct / RTX 4080. It completed with zero errors. These single-run checks establish working timing instrumentation. The bounded repeated GPU milestone is now recorded in [the experiment report](experiments/repeated_gpu_run/report.md): 12 exact-token correctness cases and 36 measured runs (288 requests), with raw data, variability, padding ratios, and plots. See [completion status](experiments/completion_status.md) for executed commands and outcomes. The broader arrival sweep below remains future work.
 
 ## Project Structure
 

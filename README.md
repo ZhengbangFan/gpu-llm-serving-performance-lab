@@ -45,7 +45,7 @@ Metric definitions:
 
 ### Token Timing And Boundaries
 
-`direct`, `batched`, and `arrival` continue to use `model.generate` as a completion API. They do not expose token timestamps: arrival records retain `ttft_ms`/`itl_ms` as `null`, while direct and batched summaries omit those fields; `token_timing_boundary` is `batch_generate_elapsed_ms_non_streaming` for those modes.
+`direct`, `batched`, and `arrival` continue to use `model.generate` as a completion API. They do not expose token timestamps: arrival records retain `ttft_ms`/`itl_ms` as `null` and identify their `token_timing_boundary` as `batch_generate_elapsed_ms_non_streaming`. Direct and batched summaries omit token timing and timing-boundary fields.
 
 `streaming` performs a fixed-length greedy decode with `model.forward(..., past_key_values=..., use_cache=True)` instead of calling `model.generate`. It uses the existing chat template and left-padded inputs. CUDA is synchronized before timing, after prefill/first-token selection, and after every decode-step token selection so each timestamp represents completed GPU work. Generation always selects exactly `--max-new-tokens` tokens; EOS is not used to shorten the run.
 
@@ -79,6 +79,10 @@ Hardware and software:
 In this controlled baseline, tensor batching improved aggregate request throughput by 3.94x and generated-token throughput by 3.94x. The result is a small, reproducible baseline rather than a general production capacity claim; larger workload sweeps are needed before drawing broader conclusions.
 
 Raw result: `results/qwen25_1.5b_baseline.json`
+
+## Token Timing Validation
+
+See [validation report](validation/README.md) for raw GPU measurements and reproduction commands. The warmed validation uses 8 requests, batch size 4, 32 tokens per request, and one four-request warmup batch on Qwen2.5-1.5B-Instruct / RTX 4080. It completed with zero errors. These single-run checks establish working timing instrumentation; the repeated sweep below remains future work.
 
 ## Project Structure
 
